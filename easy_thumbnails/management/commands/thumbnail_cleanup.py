@@ -7,6 +7,7 @@ from django.core.files.storage import get_storage_class
 from django.core.management.base import BaseCommand
 from easy_thumbnails.conf import settings
 from easy_thumbnails.models import Source
+from easy_thumbnails.utils import get_storage_hash
 
 
 class ThumbnailCollectionCleaner:
@@ -19,11 +20,11 @@ class ThumbnailCollectionCleaner:
     source_refs_deleted = 0
     execution_time = 0
 
-    def _get_absolute_path(self, path):
-        return os.path.join(settings.MEDIA_ROOT, path)
-
-    def _get_relative_path(self, path):
-        return os.path.relpath(path, settings.MEDIA_ROOT)
+    def _get_absolute_path(self, path, storage):
+        if hasattr(storage, 'location'):
+            return os.path.join(storage.location, path)
+        else:
+            return os.path.join(settings.MEDIA_ROOT, path)
 
     def _check_if_exists(self, storage, path):
         try:
@@ -36,7 +37,7 @@ class ThumbnailCollectionCleaner:
         Source.objects.all().filter(id__in=ids).delete()
 
     def clean_up(self, dry_run=False, verbosity=1, last_n_days=0,
-                 cleanup_path=None, storage=None):
+                 cleanup_path=None, storage=None, source_storage_str=None):
         """
         Iterate through sources. Delete database references to sources
         not existing, including its corresponding thumbnails (files and
@@ -47,6 +48,10 @@ class ThumbnailCollectionCleaner:
 
         if not storage:
             storage = get_storage_class(settings.THUMBNAIL_DEFAULT_STORAGE)()
+
+        if not source_storage_str:
+            source_storage_str = settings.DEFAULT_FILE_STORAGE
+        source_storage = get_storage_class(source_storage_str)()
 
         sources_to_delete = []
         time_start = time.time()
@@ -60,10 +65,16 @@ class ThumbnailCollectionCleaner:
             query = query.filter(name__startswith=cleanup_path)
 
         for source in queryset_iterator(query):
-            self.sources += 1
-            abs_source_path = self._get_absolute_path(source.name)
+            source_storage_hash = source.storage_hash
+            if get_storage_hash(source_storage) != source_storage_hash:
+                print ("Source storage mismatch:", source)
+                print ("Try to set correct source hash through --source-storage management command parameter")
+                continue
 
-            if not self._check_if_exists(storage, abs_source_path):
+            self.sources += 1
+            abs_source_path = self._get_absolute_path(source.name, source_storage)
+
+            if not self._check_if_exists(source_storage, abs_source_path):
                 if verbosity > 0:
                     print ("Source not present:", abs_source_path)
                 self.source_refs_deleted += 1
@@ -71,7 +82,7 @@ class ThumbnailCollectionCleaner:
 
                 for thumb in source.thumbnails.all():
                     self.thumbnails_deleted += 1
-                    abs_thumbnail_path = self._get_absolute_path(thumb.name)
+                    abs_thumbnail_path = self._get_absolute_path(thumb.name, storage)
 
                     if self._check_if_exists(storage, abs_thumbnail_path):
                         if not dry_run:
@@ -140,6 +151,12 @@ class Command(BaseCommand):
             dest='cleanup_path',
             type=str,
             help='Specify a path to clean up.')
+        parser.add_argument(
+            '--source-storage',
+            action='store',
+            dest='source_storage',
+            type=str,
+            help='Specify storage classpath for source files.')
 
     def handle(self, *args, **options):
         tcc = ThumbnailCollectionCleaner()
@@ -147,5 +164,7 @@ class Command(BaseCommand):
             dry_run=options.get('dry_run', False),
             verbosity=int(options.get('verbosity', 1)),
             last_n_days=int(options.get('last_n_days', 0)),
-            cleanup_path=options.get('cleanup_path'))
+            cleanup_path=options.get('cleanup_path'),
+            source_storage_str=options.get('source_storage', None),
+        )
         tcc.print_stats()
